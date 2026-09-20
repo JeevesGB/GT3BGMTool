@@ -1,7 +1,7 @@
--GT3BGMTool
+- GT3BGMTool
 A tool to add custom music to GT3.
 
--requirement
+- requirement
 Python 3.8 or newer
 
 - Usage:
