@@ -1,4 +1,4 @@
-- GT3BGMTool
+GT3BGMTool
 A tool to add custom music to GT3.
 
 - requirements
