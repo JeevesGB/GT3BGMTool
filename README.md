@@ -1,10 +1,10 @@
 GT3BGMTool
 A tool to add custom music to GT3.
 
-- requirements
+requirements
 - Python 3.8 or newer
 - Silentwarior112's PS2DL tool to build the ISO image back to format.
-- Usage:
+Usage:
 - Open the .bat file to launch the tool, click 'open ads.inf' and select the ads.inf file from the bgm folder.
 - Click 'Add new music' to add new music, in Wav/Aup3 format, give it a title and add the artist.
 - To add custom sync cuts to the music for the sync-to-beat option in the replay menu, the game uses a marked list for each song, simply split the file in audacity and save it.
