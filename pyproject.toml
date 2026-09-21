@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "gt3bgmtool"
+version = "1.0.0"
+description = "Add and manage the music in Gran Turismo 3 (PS2): ads.inf entries, PS-ADPCM audio and replay camera cuts"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { file = "LICENSE" }
+keywords = ["gran-turismo", "ps2", "ps-adpcm", "audacity", "modding", "romhacking"]
+classifiers = [
+    "Environment :: Win32 (MS Windows)",
+    "Environment :: X11 Applications",
+    "Intended Audience :: End Users/Desktop",
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Sound/Audio :: Conversion",
+    "Topic :: Games/Entertainment",
+]
+dependencies = []          # standard library only, on purpose
+
+[project.gui-scripts]
+gt3bgmtool = "gt3bgmtool:main"
+
+[tool.setuptools]
+packages = ["gt3bgm"]
+py-modules = ["gt3bgmtool"]
