@@ -26,8 +26,9 @@ from gt3bgm import psadpcm as ps
 from gt3bgm import export as ex
 from gt3bgm import verify as vfy
 from gt3bgm.mseq import Mseq, MseqSong
-from gt3bgm.seqg import SeqG, sequence_to_midi, midi_to_sequence
+from gt3bgm.seqg import SeqG, sequence_to_midi, midi_to_sequence, check_rebuild
 from gt3bgm.inst import Inst
+from gt3bgm.backup import backup_files
 
 APP = "GT3BGMTool"
 REMINDER = ("After copying the files into data/bgm/, run Options → \"Back to Default Settings\" once. "
@@ -298,8 +299,10 @@ class SeqMusicFrame(ttk.Frame):
         self.extract_ins_btn.grid(column=5, row=0, padx=6)
         self.sf2_btn = ttk.Button(bar, text="Build SoundFont…", command=self.build_soundfont, state="disabled")
         self.sf2_btn.grid(column=6, row=0)
+        self.backup_btn = ttk.Button(bar, text="Back up originals…", command=self.backup_originals, state="disabled")
+        self.backup_btn.grid(column=7, row=0, padx=6)
         self.path_lbl = ttk.Label(bar, text="no folder open", foreground="#666")
-        self.path_lbl.grid(column=7, row=0, padx=12, sticky="w")
+        self.path_lbl.grid(column=8, row=0, padx=12, sticky="w")
 
         info = ttk.LabelFrame(self, text="Sequence set", padding=6)
         info.grid(column=0, row=1, sticky="ew", pady=(8, 0))
@@ -325,7 +328,7 @@ class SeqMusicFrame(ttk.Frame):
 
     def _set_btns(self, state: str):
         for b in (self.export_mid_btn, self.export_all_btn, self.replace_btn,
-                  self.save_btn, self.extract_ins_btn, self.sf2_btn):
+                  self.save_btn, self.extract_ins_btn, self.sf2_btn, self.backup_btn):
             b.configure(state=state)
 
     def open_folder(self):
@@ -538,10 +541,10 @@ class SeqMusicFrame(ttk.Frame):
             self.refresh()
             active = sum(1 for t in new.tracks if t.events)
             self.log_fn(f"Replaced sequence {seq_i} from {os.path.basename(mid)} "
-                        f"({new.bpm:.0f} BPM, {active} tracks). Click Save files to write.")
+                        f"({new.bpm:.0f} BPM, {active} tracks). Click Save files to write it to a separate folder.")
             messagebox.showinfo(APP, f"Sequence {seq_i} replaced.\n"
                                      f"{new.bpm:.0f} BPM, {active} active tracks.\n\n"
-                                     "Click Save files… to write music.seq / music.inf.")
+                                     "Click Save files… to write music.seq into a separate folder.")
         except Exception as e:
             messagebox.showerror(APP, f"Could not import that MIDI:\n{e}")
 
@@ -636,46 +639,82 @@ class SeqMusicFrame(ttk.Frame):
             "Sample rate is assumed 22050 Hz (typical for SPU banks).\n"
             "Program/note mapping is not yet included — these are the raw samples.")
 
-    def save_files(self):
-        if not self.seqg or not self.music_dir:
+    def _original_file_names(self) -> list[str]:
+        """The files on disk that belong to the folder that is open."""
+        if self.mode == "gt2":
+            return [n for n, _ in self.gt2_seqs] + [n for n, _ in self.gt2_insts]
+        return ["music.inf", "music.seq", "music.ins"]
+
+    def backup_originals(self):
+        """Copy the original files into a new time-stamped folder. Nothing is changed or overwritten."""
+        if not self.music_dir:
+            return
+        dest_root = filedialog.askdirectory(
+            title="Put the backup into which folder? (a new dated folder is made inside it)")
+        if not dest_root:
             return
         try:
+            dest, names = backup_files(self.music_dir, self._original_file_names(), dest_root)
+        except Exception as e:
+            messagebox.showerror(APP, f"Backup failed:\n{e}")
+            return
+        self.log_fn(f"Backed up {len(names)} file(s) to {dest}")
+        messagebox.showinfo(APP, "Backed up and verified:\n  " + "\n  ".join(names) +
+                                 f"\n\ninto\n{dest}")
+
+    def save_files(self):
+        """Write the result into a folder of the user's choosing. The loaded files are never touched."""
+        if not self.seqg or not self.music_dir:
+            return
+        out = filedialog.askdirectory(
+            title="Save into which folder? (not the folder you opened - your originals stay as they are)")
+        if not out:
+            return
+        same = os.path.normcase(os.path.realpath(out)) == os.path.normcase(os.path.realpath(self.music_dir))
+        if same:
+            messagebox.showerror(APP, "That is the folder you opened.\n\nPick a different folder so your "
+                                      "original files are left alone.")
+            return
+        try:
+            # (name, bytes to write, original bytes, replaced sequence indices or None for a plain copy)
+            files: list[tuple[str, bytes, bytes, list[int] | None]] = []
             if self.mode == "gt2":
-                written = []
-                for i, (name, _) in enumerate(self.gt2_seqs):
-                    # wrap the (possibly replaced) single sequence back into a SEQG file
-                    from gt3bgm.seqg import SeqG as SG
-                    one = SG(sequences=[self.seqg.sequences[i]])
-                    data = one.write()
-                    path = os.path.join(self.music_dir, name)
-                    with open(path, "wb") as f:
-                        f.write(data)
-                    written.append(f"{name} ({len(data)} B)")
-                self.dirty = False
-                self.log_fn("Saved: " + ", ".join(written))
-                messagebox.showinfo(APP, "Wrote:\n  " + "\n  ".join(written) +
-                                         f"\n\ninto {self.music_dir}\n\n"
-                                         "Instrument banks (.ins) were left unchanged.")
+                for i, (name, sg) in enumerate(self.gt2_seqs):
+                    if not sg.sequences:
+                        continue                                    # unreadable file: nothing to write
+                    sg.sequences[0] = self.seqg.sequences[i]       # carries any replacement
+                    files.append((name, sg.write(), sg.raw, sg.replaced_indices()))
+                for name, inst in self.gt2_insts:
+                    files.append((name, inst.write(), inst.raw, None))
             else:
-                if not self.mseq or not self.inst:
-                    return
-                seq_bytes = self.seqg.write()
-                inf_bytes = self.mseq.write()
-                ins_bytes = self.inst.write()
-                with open(os.path.join(self.music_dir, "music.seq"), "wb") as f:
-                    f.write(seq_bytes)
-                with open(os.path.join(self.music_dir, "music.inf"), "wb") as f:
-                    f.write(inf_bytes)
-                with open(os.path.join(self.music_dir, "music.ins"), "wb") as f:
-                    f.write(ins_bytes)
-                self.dirty = False
-                self.log_fn(f"Saved music.inf ({len(inf_bytes)} B), music.seq ({len(seq_bytes)} B), "
-                            f"music.ins ({len(ins_bytes)} B) to {self.music_dir}")
-                messagebox.showinfo(APP, f"Wrote:\n  music.inf\n  music.seq\n  music.ins\n\n"
-                                         f"into {self.music_dir}\n\n"
-                                         "Copy them back into the game's data/music/ folder.")
+                files.append(("music.inf", self.mseq.raw, self.mseq.raw, None))
+                files.append(("music.seq", self.seqg.write(), self.seqg.raw, self.seqg.replaced_indices()))
+                files.append(("music.ins", self.inst.write(), self.inst.raw, None))
+
+            for name, data, original, replaced in files:
+                if replaced is None:
+                    problems = [] if data == original else ["this file was not meant to change but does"]
+                else:
+                    problems = check_rebuild(original, data, replaced)
+                if problems:
+                    raise ValueError(f"{name} did not rebuild cleanly, nothing was written:\n  "
+                                     + "\n  ".join(problems[:8]))
+            written = []
+            for name, data, original, replaced in files:
+                with open(os.path.join(out, name), "wb") as f:
+                    f.write(data)
+                if data == original:
+                    note = "identical to the original"
+                else:
+                    note = f"{len(replaced)} replaced"
+                written.append(f"{name} ({len(data)} B, {note})")
         except Exception as e:
             messagebox.showerror(APP, f"Could not write files:\n{e}")
+            return
+        self.dirty = False
+        self.log_fn("Saved to " + out + ": " + ", ".join(written))
+        messagebox.showinfo(APP, "Wrote:\n  " + "\n  ".join(written) + f"\n\ninto {out}\n\n"
+                                 "Copy them into the game's data/music/ folder to use them.")
 
 
 class App(ttk.Frame):

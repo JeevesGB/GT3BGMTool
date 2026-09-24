@@ -23,16 +23,18 @@ Event stream (per track)
   0x04          volume        (cmd + vol = 2 bytes)
   0x05          pan           (cmd + pan = 2 bytes)
   0x06          tempo         (rarely used)
-  0x01-0x7F     treated as pitch-bend low byte (cmd + high = 2 bytes)
-                value is 14-bit VLV-decoded then centred around 0x1000
-  0x80-0xEC     note on: note, velocity, then VLV duration
+  0x07-0x7F     other control event: cmd + one parameter byte (2 bytes). Seen in the original
+                music.seq as 0x11, 0x19, 0x50, 0x5B-0x63 and others. Meaning not yet known, so
+                they are kept as ("ctrl", cmd, param) and written back unchanged.
+  0x80-0xFF     note on: note, velocity, then VLV duration
 """
 
 from __future__ import annotations
 
 import struct
+from bisect import bisect_right
 from dataclasses import dataclass, field
-from typing import BinaryIO
+from typing import Iterable
 
 MAGIC = b"SEQG"
 TRACK_COUNT = 16
@@ -112,10 +114,17 @@ class Sequence:
     tempo_ms: int = 500_000
     track_pointers: list[int] = field(default_factory=lambda: [0] * TRACK_COUNT)
     tracks: list[SeqTrack] = field(default_factory=lambda: [SeqTrack() for _ in range(TRACK_COUNT)])
+    # True for anything built in memory (e.g. imported from MIDI). Sequences read from a file are marked
+    # False, and write() leaves those byte-for-byte as they were on disk.
+    modified: bool = True
 
     @property
     def bpm(self) -> float:
         return tempo_ms_to_bpm(self.tempo_ms)
+
+
+def _valid_ptr(ptr: int, size: int) -> bool:
+    return ptr not in (0, 0xFFFFFFFF) and ptr < size
 
 
 @dataclass
@@ -123,27 +132,39 @@ class SeqG:
     """Full music.seq container."""
     sequences: list[Sequence] = field(default_factory=list)
     raw: bytes = b""
+    header_unk: int = 0
 
     @classmethod
     def read(cls, data: bytes) -> "SeqG":
         if data[:4] != MAGIC:
             raise ValueError(f"Not a SEQG file (got {data[:4]!r})")
         unk, count = struct.unpack_from("<II", data, 4)
-        sequences: list[Sequence] = []
+
+        # Pass 1: the sequence headers. Every track pointer marks where one stream starts, so the
+        # sorted set of them also tells us where each stream stops (at the next one, or end of file).
+        headers = []
         for i in range(count):
             base = 12 + i * 72
             if base + 72 > len(data):
                 break
             vol, tempo = struct.unpack_from("<II", data, base)
             ptrs = list(struct.unpack_from(f"<{TRACK_COUNT}I", data, base + 8))
-            seq = Sequence(master_volume=vol, tempo_ms=tempo, track_pointers=ptrs)
+            headers.append((vol, tempo, ptrs))
+        starts = sorted({p for _, _, ptrs in headers for p in ptrs if _valid_ptr(p, len(data))})
+
+        def bound_of(ptr: int) -> int:
+            i = bisect_right(starts, ptr)
+            return starts[i] if i < len(starts) else len(data)
+
+        # Pass 2: the event streams
+        sequences: list[Sequence] = []
+        for vol, tempo, ptrs in headers:
+            seq = Sequence(master_volume=vol, tempo_ms=tempo, track_pointers=ptrs, modified=False)
             for t, ptr in enumerate(ptrs):
-                if ptr == 0 or ptr == 0xFFFFFFFF or ptr >= len(data):
-                    continue
-                seq.tracks[t] = _parse_track(data, ptr)
+                if _valid_ptr(ptr, len(data)):
+                    seq.tracks[t] = _parse_track(data, ptr, bound_of(ptr))
             sequences.append(seq)
-        obj = cls(sequences=sequences, raw=data)
-        return obj
+        return cls(sequences=sequences, raw=data, header_unk=unk)
 
     @classmethod
     def open(cls, path: str) -> "SeqG":
@@ -151,49 +172,111 @@ class SeqG:
             return cls.read(f.read())
 
     def write(self) -> bytes:
-        """Rebuild a SEQG binary. Track event streams are written after the header table."""
+        """Serialise the container.
+
+        Sequences that were read from the file and not replaced keep their original bytes exactly.
+        With nothing replaced the original file comes back unchanged. Only replaced sequences are
+        rebuilt, so 'open, save, compare' on an untouched file is a true no-op.
+        """
+        n = len(self.sequences)
+        loaded_n = struct.unpack_from("<I", self.raw, 8)[0] if len(self.raw) >= 12 else -1
+        if self.raw and n == loaded_n:
+            if not any(s.modified for s in self.sequences):
+                return self.raw
+            if any(not s.modified for s in self.sequences):
+                return self._patch()
+        return self._build_fresh()
+
+    def _patch(self) -> bytes:
+        """Keep the loaded file as it is; append each replaced sequence's tracks and repoint its header.
+
+        Untouched sequences stay at their original offsets. The old bytes of a replaced sequence are
+        zeroed (not removed, so nothing else moves), which also keeps a reader from running on into
+        stale data. The file grows by the size of the new data.
+        """
+        out = bytearray(self.raw)
+        orig = SeqG.read(self.raw)
+        keep = {p for i, s_ in enumerate(orig.sequences) if not self.sequences[i].modified
+                for p in s_.track_pointers if _valid_ptr(p, len(self.raw))}
+        starts = sorted({p for s_ in orig.sequences for p in s_.track_pointers if _valid_ptr(p, len(self.raw))})
+        for i, s_ in enumerate(orig.sequences):                 # the replaced sequences' old streams
+            if not self.sequences[i].modified:
+                continue
+            for p in s_.track_pointers:
+                if _valid_ptr(p, len(self.raw)) and p not in keep:
+                    nxt = bisect_right(starts, p)
+                    stop = starts[nxt] if nxt < len(starts) else len(self.raw)
+                    out[p:stop] = bytes(stop - p)
+        for i, seq in enumerate(self.sequences):
+            if not seq.modified:
+                continue
+            ptrs = []
+            for track in seq.tracks:
+                while len(out) % 4:
+                    out.append(0)
+                ptrs.append(len(out))
+                out += _track_bytes(track)
+            struct.pack_into(f"<II{TRACK_COUNT}I", out, 12 + i * 72, seq.master_volume, seq.tempo_ms, *ptrs)
+        return bytes(out)
+
+    def _build_fresh(self) -> bytes:
+        """Lay the whole container out from scratch (no usable original, or every sequence replaced)."""
         count = len(self.sequences)
-        header = bytearray()
-        header += MAGIC
-        header += struct.pack("<II", 0, count)
-
-        # Placeholder for sequence headers; fill after we know data offsets
-        header_size = 12 + count * 72
-        data_parts: list[bytes] = []
-        data_offset = header_size
-
-        seq_headers: list[bytes] = []
+        offset = 12 + count * 72
+        headers = bytearray()
+        body = bytearray()
         for seq in self.sequences:
             ptrs = []
             for track in seq.tracks:
-                raw = track.raw if track.raw else _encode_track(track)
-                if not raw:
-                    # empty track still needs an end marker
-                    raw = encode_vlv(0) + bytes([CMD_END, 0, 0])
-                ptrs.append(data_offset if raw else 0)
-                data_parts.append(raw)
-                data_offset += len(raw)
-            # pad to 16
-            while len(ptrs) < TRACK_COUNT:
-                ptrs.append(0)
-            sh = struct.pack("<II", seq.master_volume, seq.tempo_ms)
-            sh += struct.pack(f"<{TRACK_COUNT}I", *ptrs[:TRACK_COUNT])
-            seq_headers.append(sh)
+                raw = _track_bytes(track)
+                ptrs.append(offset + len(body))
+                body += raw
+            headers += struct.pack("<II", seq.master_volume, seq.tempo_ms)
+            headers += struct.pack(f"<{TRACK_COUNT}I", *ptrs[:TRACK_COUNT])
+        return MAGIC + struct.pack("<II", self.header_unk, count) + bytes(headers) + bytes(body)
 
-        out = bytearray()
-        out += MAGIC
-        out += struct.pack("<II", 0, count)
-        for sh in seq_headers:
-            out += sh
-        for part in data_parts:
-            out += part
-        return bytes(out)
+    def replaced_indices(self) -> list[int]:
+        return [i for i, s in enumerate(self.sequences) if s.modified]
 
     def sequence_count(self) -> int:
         return len(self.sequences)
 
 
-def _parse_track(data: bytes, start: int) -> SeqTrack:
+def _track_bytes(track: SeqTrack) -> bytes:
+    raw = track.raw if track.raw else _encode_track(track)
+    if not raw:
+        raw = encode_vlv(0) + bytes([CMD_END, 0, 0])      # an empty track still needs an end marker
+    return raw
+
+
+def check_rebuild(original: bytes, rebuilt: bytes, replaced: Iterable[int] = ()) -> list[str]:
+    """Compare a rebuilt music.seq with the original. Returns a list of problems (empty means fine).
+
+    Every sequence not in `replaced` must have the same header values and the same track bytes.
+    With nothing replaced the two files must be identical.
+    """
+    replaced = set(replaced)
+    problems: list[str] = []
+    if not replaced and rebuilt != original:
+        problems.append(f"nothing was replaced but the file changed ({len(original)} -> {len(rebuilt)} bytes)")
+    try:
+        a, b = SeqG.read(original), SeqG.read(rebuilt)
+    except ValueError as e:
+        return problems + [f"rebuilt file does not read back: {e}"]
+    if len(a.sequences) != len(b.sequences):
+        return problems + [f"sequence count changed ({len(a.sequences)} -> {len(b.sequences)})"]
+    for i, (x, y) in enumerate(zip(a.sequences, b.sequences)):
+        if i in replaced:
+            continue
+        if (x.master_volume, x.tempo_ms) != (y.master_volume, y.tempo_ms):
+            problems.append(f"sequence {i}: header values changed")
+        for t, (tx, ty) in enumerate(zip(x.tracks, y.tracks)):
+            if not ty.raw.startswith(tx.raw):               # may run on into zeroed data, never differ
+                problems.append(f"sequence {i} track {t}: bytes differ ({len(tx.raw)} -> {len(ty.raw)})")
+    return problems
+
+
+def _parse_track(data: bytes, start: int, bound: int | None = None) -> SeqTrack:
     """Parse one SEQG track.
 
     Per leo-the-leon/vgm-specs (gran-turismo/SEQG.md) and xan1242/gtseq2midi:
@@ -206,11 +289,20 @@ def _parse_track(data: bytes, start: int) -> SeqTrack:
     Bytes 00-7F are deltas / velocities / durations (high bit clear).
     Bytes 80-FF are note numbers (high bit set). Pitch-bend is NOT
     documented in vgm-specs; we no longer invent bend events from low bytes.
+
+    `bound` is where this stream's bytes stop: the next track pointer in the file, or the end of
+    the file. Parsing ends at the 02 marker, but the stream's raw bytes always run to `bound`, so
+    anything after the marker (padding) is kept and a save can never cut a track short.
+
+    Command bytes 07-7F are two-byte events (cmd + parameter). Reading them as one byte throws the
+    parse off by one, after which a data byte can look like a 02 and end the track early.
     """
     track = SeqTrack()
     if start == 0 or start == 0xFFFFFFFF or start >= len(data):
         return track
 
+    if bound is None or bound <= start:
+        bound = len(data)
     cursor = start
     abs_time = 0
     max_iters = 500_000
@@ -226,12 +318,13 @@ def _parse_track(data: bytes, start: int) -> SeqTrack:
 
         # --- control events (type byte 01-06; value follows) ---
         if cmd == CMD_LOOP:  # 0x01
-            # value byte often 0xFF = infinite; we only need the marker
-            track.append(abs_time, CMD_LOOP)
+            # value byte is 0xFF for an infinite loop; keep it so a re-encode does not lose it
+            track.append(abs_time, CMD_LOOP, data[cursor + 1] if cursor + 1 < len(data) else 0)
             cursor += 2
         elif cmd == CMD_END:  # 0x02
             param = data[cursor + 1] if cursor + 1 < len(data) else 0
-            track.append(abs_time, CMD_END, param)
+            pad = data[cursor + 2] if cursor + 2 < len(data) else 0
+            track.append(abs_time, CMD_END, param, pad)
             # GTSeq2Midi advances 3; value + pad
             cursor += 3
             break
@@ -266,11 +359,12 @@ def _parse_track(data: bytes, start: int) -> SeqTrack:
             track.append(abs_time, "note", note, vel, max(dur, 0))
             cursor += 2 + dlen
         else:
-            # Unknown low byte in command position — skip one to resync
-            track.append(abs_time, "unknown", cmd)
-            cursor += 1
+            # 07-7F: cmd + one parameter byte. Meaning unknown, so keep it verbatim.
+            param = data[cursor + 1] if cursor + 1 < len(data) else 0
+            track.append(abs_time, "ctrl", cmd, param)
+            cursor += 2
 
-    end = min(cursor, len(data))
+    end = min(max(cursor, bound), len(data))
     track.raw = data[start:end]
     return track
 
@@ -289,10 +383,11 @@ def _encode_track(track: SeqTrack) -> bytes:
         if cmd == CMD_NOP:
             out.append(CMD_NOP)
         elif cmd == CMD_LOOP:
-            out += bytes([CMD_LOOP, 0])
+            out += bytes([CMD_LOOP, (ev[2] if len(ev) > 2 else 0xFF) & 0xFF])
         elif cmd == CMD_END:
             param = ev[2] if len(ev) > 2 else 0
-            out += bytes([CMD_END, param & 0xFF, 0])
+            pad = ev[3] if len(ev) > 3 else 0
+            out += bytes([CMD_END, param & 0xFF, pad & 0xFF])
         elif cmd == CMD_PROGRAM:
             out += bytes([CMD_PROGRAM, ev[2] & 0xFF])
         elif cmd == CMD_VOLUME:
@@ -301,6 +396,8 @@ def _encode_track(track: SeqTrack) -> bytes:
             out += bytes([CMD_PAN, ev[2] & 0xFF])
         elif cmd == CMD_TEMPO:
             out += bytes([CMD_TEMPO, ev[2] & 0xFF])
+        elif cmd == "ctrl":
+            out += bytes([ev[2] & 0x7F, ev[3] & 0xFF])
         elif cmd == "bend":
             bend = ev[2] & 0xFFFF
             low = bend & 0xFF
@@ -362,48 +459,48 @@ def sequence_to_midi(seq: Sequence, path: str) -> None:
     for ch, track in enumerate(seq.tracks):
         if not track.events:
             continue
-        buf = bytearray()
-        last = 0
-        for ev in track.events:
-            tick = ev[0]
-            cmd = ev[1]
-            args = ev[2:]
-            delta = max(0, tick - last)
-            last = tick
-            write_vlv(buf, delta)
+        c = ch & 0x0F
+        # Build absolute-time events first, then sort, then write deltas. Note-on and note-off are
+        # separate events: a note's off lands at start + duration, which is usually later than the next
+        # note's start (chords, legato), so deltas cannot be chained note by note.
+        # Sort order at one tick: note-offs, then program/controller/meta, then note-ons.
+        timed: list[tuple[int, int, int, bytes]] = []      # (tick, order, index, bytes)
+        for n, ev in enumerate(track.events):
+            tick, cmd, args = ev[0], ev[1], ev[2:]
             if cmd == CMD_PROGRAM and args:
                 # SEQG programs are 1-based; General MIDI is 0-based
-                prog = max(0, (int(args[0]) & 0x7F) - 1)
-                buf += bytes([0xC0 | (ch & 0x0F), prog])
+                timed.append((tick, 1, n, bytes([0xC0 | c, max(0, (int(args[0]) & 0x7F) - 1)])))
             elif cmd == CMD_VOLUME and args:
-                buf += bytes([0xB0 | (ch & 0x0F), 7, int(args[0]) & 0x7F])
+                timed.append((tick, 1, n, bytes([0xB0 | c, 7, int(args[0]) & 0x7F])))
             elif cmd == CMD_PAN and args:
-                buf += bytes([0xB0 | (ch & 0x0F), 10, int(args[0]) & 0x7F])
+                timed.append((tick, 1, n, bytes([0xB0 | c, 10, int(args[0]) & 0x7F])))
             elif cmd == "note" and len(args) >= 3:
-                note, vel, dur = int(args[0]), int(args[1]), int(args[2])
-                n = note & 0x7F
+                note, vel, dur = int(args[0]) & 0x7F, int(args[1]), int(args[2])
                 v = max(1, min(127, vel & 0x7F))
-                # duration 0 → one tick so the note is audible in players
-                d = max(1, dur)
-                buf += bytes([0x90 | (ch & 0x0F), n, v])
-                write_vlv(buf, d)
-                buf += bytes([0x80 | (ch & 0x0F), n, 0])
-                last += d
+                d = max(1, dur)                            # duration 0 -> one tick so it is audible
+                timed.append((tick, 2, n, bytes([0x90 | c, note, v])))
+                timed.append((tick + d, 0, n, bytes([0x80 | c, note, 0])))
             elif cmd == CMD_LOOP:
                 name = b"loopStart"
-                buf += bytes([0xFF, 0x06, len(name)]) + name
+                timed.append((tick, 1, n, bytes([0xFF, 0x06, len(name)]) + name))
             elif cmd == CMD_END:
                 name = b"loopEnd"
-                buf += bytes([0xFF, 0x06, len(name)]) + name
+                timed.append((tick, 1, n, bytes([0xFF, 0x06, len(name)]) + name))
             elif cmd == "bend" and args:
                 bend = int(args[0])
-                lsb = bend & 0x7F
-                msb = (bend >> 7) & 0x7F
-                buf += bytes([0xE0 | (ch & 0x0F), lsb, msb])
-            else:
-                # remove the delta we already wrote for events we skip
-                # (rebuild without it by not having written... too late; leave as rest)
-                pass
+                timed.append((tick, 1, n, bytes([0xE0 | c, bend & 0x7F, (bend >> 7) & 0x7F])))
+            # anything else has no MIDI form: it adds nothing here, and no delta is written for it
+
+        timed.sort(key=lambda t: t[:3])
+        buf = bytearray()
+        label = f"GT track {ch}".encode()
+        write_vlv(buf, 0)
+        buf += bytes([0xFF, 0x03, len(label)]) + label     # lets an import map the track back exactly
+        last = 0
+        for tick, _, _, data in timed:
+            write_vlv(buf, tick - last)
+            buf += data
+            last = tick
         write_vlv(buf, 0)
         buf += bytes([0xFF, 0x2F, 0x00])
         tracks_data.append(bytes(buf))
@@ -519,9 +616,37 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
                     seq.tempo_ms = bpm_to_tempo_ms(bpm)
                 break
 
-    # Collect note ons per channel and pair with note offs
+    # loopStart / loopEnd text markers (written by sequence_to_midi and by GTSeq2Midi).
+    # Original SEQG files put the same LOOP tick and the same END tick on every track of a
+    # sequence. When tracks end at different times the game restarts the short ones while the
+    # long ones are still playing, which is heard as the sequence overlapping itself.
+    # So we collect markers globally and force one shared END across all tracks.
+    loops: dict[int, list[int]] = {}
+    loop_ends: list[int] = []
+    for evs in midi_tracks:
+        target = None
+        for e in evs:                                   # our own export names each track "GT track N"
+            if e[1] == 0xFF and e[2] == 0x03 and e[3].startswith(b"GT track "):
+                try:
+                    target = int(e[3][9:])
+                except ValueError:
+                    pass
+        if target is None:
+            chans = sorted({e[2] for e in evs if e[1] != 0xFF})
+            target = chans[0] if chans else None
+        for e in evs:
+            if e[1] != 0xFF or e[2] not in (0x01, 0x05, 0x06):
+                continue
+            name = e[3].strip()
+            if name == b"loopStart" and target is not None and 0 <= target < TRACK_COUNT:
+                loops.setdefault(target, []).append(e[0])
+            elif name == b"loopEnd":
+                loop_ends.append(e[0])
+
+    # First pass: build events for every channel (no END yet) so we can pick one global end tick.
+    built: list[SeqTrack] = [SeqTrack() for _ in range(TRACK_COUNT)]
+    max_note_end = 0
     for ch in range(TRACK_COUNT):
-        # gather events for this channel from all midi tracks
         ch_events = []
         for evs in midi_tracks:
             for e in evs:
@@ -531,7 +656,9 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
                     ch_events.append(e)
         ch_events.sort(key=lambda x: x[0])
 
-        gt = SeqTrack()
+        gt = built[ch]
+        for tick in loops.get(ch, []):
+            gt.append(tick, CMD_LOOP, 0xFF)
         active: dict[int, tuple[int, int]] = {}  # note -> (start_tick, vel)
 
         for e in ch_events:
@@ -539,12 +666,11 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
             if etype == 0x90:  # note on
                 note, vel = e[3], e[4]
                 if vel == 0:
-                    # note off
                     if note in active:
                         start, v = active.pop(note)
                         dur = max(1, tick - start)
-                        # encode note in 0x80+ range as GT expects
                         gt.append(start, "note", note & 0x7F, v, dur)
+                        max_note_end = max(max_note_end, start + dur)
                 else:
                     active[note] = (tick, vel)
             elif etype == 0x80:  # note off
@@ -553,8 +679,9 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
                     start, v = active.pop(note)
                     dur = max(1, tick - start)
                     gt.append(start, "note", note & 0x7F, v, dur)
+                    max_note_end = max(max_note_end, start + dur)
             elif etype == 0xC0:
-                gt.append(tick, CMD_PROGRAM, e[3] & 0x7F)
+                gt.append(tick, CMD_PROGRAM, (e[3] & 0x7F) + 1)     # MIDI 0-based -> SEQG 1-based
             elif etype == 0xB0:
                 cc, val = e[3], e[4]
                 if cc == 7:
@@ -562,14 +689,31 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
                 elif cc == 10:
                     gt.append(tick, CMD_PAN, val & 0x7F)
 
-        # flush remaining active notes with short duration
         for note, (start, v) in active.items():
-            gt.append(start, "note", note & 0x7F, v, PPQN // 4)
+            dur = PPQN // 4
+            gt.append(start, "note", note & 0x7F, v, dur)
+            max_note_end = max(max_note_end, start + dur)
 
         gt.events.sort(key=lambda x: x[0])
-        # ensure end marker
-        end_tick = gt.events[-1][0] + 1 if gt.events else 0
-        gt.append(end_tick, CMD_END, 0)
+
+    # One END tick for the whole sequence: prefer an explicit loopEnd marker, else just past the
+    # last note. Original files always share this value across tracks.
+    if loop_ends:
+        end_tick = max(loop_ends)
+    else:
+        end_tick = max_note_end + 1 if max_note_end else 0
+
+    # Tracks that only carry a loop marker still need the shared END so they stay in sync.
+    any_content = any(t.events for t in built)
+    for ch in range(TRACK_COUNT):
+        gt = built[ch]
+        if not gt.events and not any_content:
+            continue
+        # Drop any LOOP that sits at or after the chosen END (would never be reached).
+        gt.events = [ev for ev in gt.events if not (ev[1] == CMD_LOOP and ev[0] >= end_tick)]
+        if end_tick > 0 or gt.events:
+            gt.append(end_tick, CMD_END, 0)
+        gt.events.sort(key=lambda x: x[0])
         gt.raw = _encode_track(gt)
         seq.tracks[ch] = gt
 

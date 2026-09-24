@@ -12,15 +12,19 @@ Commands
   info                          summary of all three files
   export-midi <seq_index> [out] extract one sequence to MIDI
   export-all-midi <outdir>      extract every sequence to MIDI
-  replace-seq <seq_index> <mid> replace a sequence from a MIDI file
-  save                          write modified files back (after replace-seq)
+  replace-seq <seq_index> <mid> replace a sequence from a MIDI file and write all three files to --out
+  save                          write music.inf, music.seq and music.ins to --out
+  backup                        copy music.inf/seq/ins into a new dated folder inside --out
+
+Nothing is ever written over the folder given with -d. Output goes to --out (default: music_out),
+which must be a different folder.
 
 Usage examples
 --------------
   python gt3seqtool.py -d path/to/music list
   python gt3seqtool.py -d path/to/music export-midi 0 main01.mid
   python gt3seqtool.py -d path/to/music replace-seq 0 new_song.mid
-  python gt3seqtool.py -d path/to/music save
+  python gt3seqtool.py -d path/to/music -o my_output save
 """
 
 from __future__ import annotations
@@ -33,8 +37,9 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from gt3bgm.mseq import Mseq
-from gt3bgm.seqg import SeqG, sequence_to_midi, midi_to_sequence
+from gt3bgm.seqg import SeqG, sequence_to_midi, midi_to_sequence, check_rebuild
 from gt3bgm.inst import Inst
+from gt3bgm.backup import backup_files
 
 
 class MusicSet:
@@ -106,30 +111,34 @@ class MusicSet:
         print(f"Replaced sequence {seq_index} from {midi_path} "
               f"({new.bpm:.1f} BPM, "
               f"{sum(1 for t in new.tracks if t.events)} active tracks)")
-        print("Call 'save' to write music.seq")
 
-    def save(self):
-        # Rebuild seq
+    def save(self, out_dir: str):
+        """Write music.inf, music.seq and music.ins into out_dir. Unreplaced data is copied exactly."""
+        if os.path.normcase(os.path.realpath(out_dir)) == os.path.normcase(os.path.realpath(self.directory)):
+            raise SystemExit("--out is the same folder as --dir. Pick another folder so your originals "
+                             "are not overwritten.")
         seq_bytes = self.seqg.write()
-        with open(self.seq_path, "wb") as f:
-            f.write(seq_bytes)
-        print(f"Wrote {self.seq_path} ({len(seq_bytes)} bytes)")
-        # inf is only rewritten if we ever mutate it; for now identity is fine
-        # but rewrite anyway so offsets stay consistent with any future edits
-        inf_bytes = self.mseq.write()
-        with open(self.inf_path, "wb") as f:
-            f.write(inf_bytes)
-        print(f"Wrote {self.inf_path} ({len(inf_bytes)} bytes)")
-        # inst identity
-        with open(self.ins_path, "wb") as f:
-            f.write(self.inst.write())
-        print(f"Wrote {self.ins_path} ({self.inst.size} bytes) [unchanged]")
+        problems = check_rebuild(self.seqg.raw, seq_bytes, self.seqg.replaced_indices())
+        if problems:
+            raise SystemExit("music.seq did not rebuild cleanly, nothing written:\n  " + "\n  ".join(problems[:8]))
+        os.makedirs(out_dir, exist_ok=True)
+        for name, data, original in (("music.inf", self.mseq.raw, self.mseq.raw),
+                                     ("music.seq", seq_bytes, self.seqg.raw),
+                                     ("music.ins", self.inst.write(), self.inst.raw)):
+            path = os.path.join(out_dir, name)
+            with open(path, "wb") as f:
+                f.write(data)
+            same = "identical to the original" if data == original else \
+                f"{len(self.seqg.replaced_indices())} sequence(s) replaced"
+            print(f"Wrote {path} ({len(data)} bytes, {same})")
         self._dirty = False
 
 
 def main(argv=None):
     p = argparse.ArgumentParser(description="GT3 sequenced music tool (Phases 1–3)")
     p.add_argument("-d", "--dir", default=".", help="directory containing music.inf/seq/ins")
+    p.add_argument("-o", "--out", default="music_out",
+                   help="folder for saved files (default: music_out). Must differ from --dir")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list", help="list songs")
@@ -146,7 +155,8 @@ def main(argv=None):
     r.add_argument("seq_index", type=int)
     r.add_argument("midi")
 
-    sub.add_parser("save", help="write modified files back to disk")
+    sub.add_parser("save", help="write music.inf, music.seq and music.ins into --out")
+    sub.add_parser("backup", help="copy the original files into a new dated folder inside --out")
 
     ei = sub.add_parser("extract-instruments", help="extract samples from .ins to WAV/VAG")
     ei.add_argument("outdir", nargs="?", default="instruments_out")
@@ -203,6 +213,18 @@ def main(argv=None):
             print(f"{os.path.basename(path)}: {len(inst.samples)} samples → {sf2_path}")
         return
 
+    if args.cmd == "backup":
+        d = args.dir
+        names = [n for n in ("music.inf", "music.seq", "music.ins") if os.path.isfile(os.path.join(d, n))]
+        if not names:                                   # GT2-style loose files
+            names = sorted(f for f in os.listdir(d) if f.lower().endswith((".seq", ".ins")))
+        try:
+            dest, done = backup_files(d, names, args.out)
+        except (ValueError, OSError) as e:
+            raise SystemExit(str(e))
+        print(f"Backed up and verified {len(done)} file(s) into {dest}")
+        return
+
     ms = MusicSet(args.dir)
 
     if args.cmd == "list":
@@ -216,10 +238,9 @@ def main(argv=None):
         ms.export_all_midi(args.outdir)
     elif args.cmd == "replace-seq":
         ms.replace_seq(args.seq_index, args.midi)
-        # auto-save for convenience
-        ms.save()
+        ms.save(args.out)
     elif args.cmd == "save":
-        ms.save()
+        ms.save(args.out)
     else:
         p.error(f"unknown command {args.cmd}")
 

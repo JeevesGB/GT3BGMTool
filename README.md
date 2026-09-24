@@ -95,21 +95,23 @@ Rows are coloured to show state: green for new, orange for edited, red for a son
 The **Sequenced music** tab works on the menu and dealer music in `data/music/`.
 
 1. Click **Open music folder…** and choose the folder containing `music.inf`, `music.seq` and `music.ins`.
-2. Use **Export MIDI…** or **Export all MIDI…** to get the sequences out.
-3. Use **Replace sequence from MIDI…** to swap one in, then **Save files…** to write the result.
-4. **Extract instruments…** and **Build SoundFont…** pull the instrument samples out of `music.ins`.
+2. Click **Back up originals…** and choose a folder. The tool makes a new dated folder inside it and copies your original files there, checking each copy matches. Do this before anything else.
+3. Use **Export MIDI…** or **Export all MIDI…** to get the sequences out.
+4. Use **Replace sequence from MIDI…** to swap one in, then **Save files…** and choose a **different folder**. The tool never writes over the folder you opened, so your originals are safe. It refuses to save into the same folder.
+5. **Extract instruments…** and **Build SoundFont…** pull the instrument samples out of `music.ins`.
 
 ### Command line
 
 The same features are available without the GUI:
 
 ```
+python gt3seqtool.py -d path/to/music -o my_backups backup
 python gt3seqtool.py -d path/to/music list
 python gt3seqtool.py -d path/to/music info
 python gt3seqtool.py -d path/to/music export-midi 0 main01.mid
 python gt3seqtool.py -d path/to/music export-all-midi midi_out
-python gt3seqtool.py -d path/to/music replace-seq 0 new_song.mid
-python gt3seqtool.py -d path/to/music save
+python gt3seqtool.py -d path/to/music -o my_output replace-seq 0 new_song.mid
+python gt3seqtool.py -d path/to/music -o my_output save
 python gt3seqtool.py -d path/to/music extract-instruments instruments_out
 python gt3seqtool.py -d path/to/music build-sf2 sf2_out
 ```
@@ -119,6 +121,7 @@ python gt3seqtool.py -d path/to/music build-sf2 sf2_out
 - The in-game **Favorite Music List** holds a maximum of **64 songs**.
 - Every song's file name must be **unique**. The game identifies songs by a hash of the file name.
 - The tool refuses to open an `ads.inf` it cannot rebuild byte for byte. If you get that warning, please report the file.
+- Saving sequenced music always writes all three files (`music.inf`, `music.seq`, `music.ins`) to the folder you choose. Anything you did not replace is copied byte-for-byte, so opening and saving without changes gives back identical files.
 - Race BGM audio is never resampled or normalised for you. Prepare it in Audacity first.
 - The `.bat` launcher is Windows-only. On macOS and Linux, run `python3 gt3bgmtool.py`.
 
