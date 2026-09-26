@@ -1,33 +1,3 @@
-"""Gran Turismo SEQG (music.seq) format — multi-sequence container.
-
-Based on research by xan1242 (GTSeq2Midi) and analysis of GT3 music.seq.
-
-Layout
-------
-  0x00  'SEQG'
-  0x04  unknown (usually 0)
-  0x08  sequence count (N)
-  0x0C  Sequence[N] headers, each 72 bytes:
-          MasterVolume  u32
-          TempoMS       u32   (microseconds-ish; BPM = 240_000_000 / TempoMS)
-          TrackPtr[16]  u32   (file offsets into the event streams)
-
-Event stream (per track)
-------------------------
-  VLV delta-time, then command byte:
-
-  0x00          nop / padding (1 byte)
-  0x01          loop marker   (cmd + 1 pad = 2 bytes)
-  0x02          end of track  (cmd + 2 bytes = 3 bytes)
-  0x03          program/instrument change (cmd + program = 2 bytes)
-  0x04          volume        (cmd + vol = 2 bytes)
-  0x05          pan           (cmd + pan = 2 bytes)
-  0x06          tempo         (rarely used)
-  0x07-0x7F     other control event: cmd + one parameter byte (2 bytes). Seen in the original
-                music.seq as 0x11, 0x19, 0x50, 0x5B-0x63 and others. Meaning not yet known, so
-                they are kept as ("ctrl", cmd, param) and written back unchanged.
-  0x80-0xFF     note on: note, velocity, then VLV duration
-"""
 
 from __future__ import annotations
 
@@ -52,7 +22,6 @@ CMD_TEMPO = 0x06
 
 
 def encode_vlv(value: int) -> bytes:
-    """Encode an unsigned integer as a MIDI-style variable-length quantity (little-endian byte order as used by GT)."""
     if value < 0:
         raise ValueError("VLV cannot be negative")
     if value == 0:
@@ -72,7 +41,6 @@ def encode_vlv(value: int) -> bytes:
 
 
 def decode_vlv(data: bytes, offset: int = 0) -> tuple[int, int]:
-    """Decode a GT VLV starting at offset. Returns (value, bytes_consumed)."""
     value = 0
     length = 0
     for i in range(4):
@@ -100,7 +68,6 @@ def bpm_to_tempo_ms(bpm: float) -> int:
 
 @dataclass
 class SeqTrack:
-    """Decoded event list for one track."""
     events: list[tuple] = field(default_factory=list)  # (abs_tick, cmd, *args)
     raw: bytes = b""
 
@@ -129,7 +96,6 @@ def _valid_ptr(ptr: int, size: int) -> bool:
 
 @dataclass
 class SeqG:
-    """Full music.seq container."""
     sequences: list[Sequence] = field(default_factory=list)
     raw: bytes = b""
     header_unk: int = 0
@@ -172,12 +138,7 @@ class SeqG:
             return cls.read(f.read())
 
     def write(self) -> bytes:
-        """Serialise the container.
 
-        Sequences that were read from the file and not replaced keep their original bytes exactly.
-        With nothing replaced the original file comes back unchanged. Only replaced sequences are
-        rebuilt, so 'open, save, compare' on an untouched file is a true no-op.
-        """
         n = len(self.sequences)
         loaded_n = struct.unpack_from("<I", self.raw, 8)[0] if len(self.raw) >= 12 else -1
         if self.raw and n == loaded_n:
@@ -188,12 +149,7 @@ class SeqG:
         return self._build_fresh()
 
     def _patch(self) -> bytes:
-        """Keep the loaded file as it is; append each replaced sequence's tracks and repoint its header.
 
-        Untouched sequences stay at their original offsets. The old bytes of a replaced sequence are
-        zeroed (not removed, so nothing else moves), which also keeps a reader from running on into
-        stale data. The file grows by the size of the new data.
-        """
         out = bytearray(self.raw)
         orig = SeqG.read(self.raw)
         keep = {p for i, s_ in enumerate(orig.sequences) if not self.sequences[i].modified
@@ -220,7 +176,6 @@ class SeqG:
         return bytes(out)
 
     def _build_fresh(self) -> bytes:
-        """Lay the whole container out from scratch (no usable original, or every sequence replaced)."""
         count = len(self.sequences)
         offset = 12 + count * 72
         headers = bytearray()
@@ -250,11 +205,7 @@ def _track_bytes(track: SeqTrack) -> bytes:
 
 
 def check_rebuild(original: bytes, rebuilt: bytes, replaced: Iterable[int] = ()) -> list[str]:
-    """Compare a rebuilt music.seq with the original. Returns a list of problems (empty means fine).
 
-    Every sequence not in `replaced` must have the same header values and the same track bytes.
-    With nothing replaced the two files must be identical.
-    """
     replaced = set(replaced)
     problems: list[str] = []
     if not replaced and rebuilt != original:
@@ -277,26 +228,7 @@ def check_rebuild(original: bytes, rebuilt: bytes, replaced: Iterable[int] = ())
 
 
 def _parse_track(data: bytes, start: int, bound: int | None = None) -> SeqTrack:
-    """Parse one SEQG track.
 
-    Per leo-the-leon/vgm-specs (gran-turismo/SEQG.md) and xan1242/gtseq2midi:
-
-    Stream is:  VLV-delta, then either
-      - event:   type (01-06) + value   [often preceded by a 00 delta]
-      - note:    note (80-FF) + velocity (00-7F) + VLV duration
-      - end:     02 + padding
-
-    Bytes 00-7F are deltas / velocities / durations (high bit clear).
-    Bytes 80-FF are note numbers (high bit set). Pitch-bend is NOT
-    documented in vgm-specs; we no longer invent bend events from low bytes.
-
-    `bound` is where this stream's bytes stop: the next track pointer in the file, or the end of
-    the file. Parsing ends at the 02 marker, but the stream's raw bytes always run to `bound`, so
-    anything after the marker (padding) is kept and a save can never cut a track short.
-
-    Command bytes 07-7F are two-byte events (cmd + parameter). Reading them as one byte throws the
-    parse off by one, after which a data byte can look like a 02 and end the track early.
-    """
     track = SeqTrack()
     if start == 0 or start == 0xFFFFFFFF or start >= len(data):
         return track
@@ -517,14 +449,7 @@ def sequence_to_midi(seq: Sequence, path: str) -> None:
 
 
 def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
-    """Parse a Type-0/1 MIDI file into a GT Sequence (best-effort).
 
-    Limitations (Phase 3):
-    - Only note on/off, program, volume (CC7), pan (CC10), tempo are mapped.
-    - Pitch bend is approximated.
-    - Complex MIDI features (sysex, RPN, etc.) are ignored.
-    - Note numbers are written in the 0x80-0xEC style expected by the GT player.
-    """
     with open(path, "rb") as f:
         data = f.read()
 
@@ -693,6 +618,14 @@ def midi_to_sequence(path: str, master_volume: int = 0x4000) -> Sequence:
             dur = PPQN // 4
             gt.append(start, "note", note & 0x7F, v, dur)
             max_note_end = max(max_note_end, start + dur)
+
+        # GT3's player does not default an unset track to centre pan (it's left-biased), and most
+        # DAWs only ever emit CC10 when the user actually moves a pan control. Without this, any
+        # track whose source MIDI never touched pan comes out skewed left in-game. So make "no pan
+        # command" impossible: every populated track always starts with an explicit centre pan
+        # unless the MIDI already gave it one at tick 0.
+        if gt.events and not any(ev[1] == CMD_PAN and ev[0] == 0 for ev in gt.events):
+            gt.append(0, CMD_PAN, 0x40)
 
         gt.events.sort(key=lambda x: x[0])
 

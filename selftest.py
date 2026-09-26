@@ -1,15 +1,3 @@
-"""Checks the tool against data it builds itself - no game files needed.
-
-Run it after cloning, or before trusting a change:
-
-    python selftest.py                 # everything that needs no outside data
-    python selftest.py song.aup3       # also parse a real Audacity project
-    python selftest.py music.seq       # also check a real music.seq survives open > save unchanged
-
-This proves the code paths are sound. It does not replace testing against PD's own files, which is what
-actually settles whether a format reading is right.
-"""
-
 from __future__ import annotations
 import math
 import os
@@ -25,7 +13,6 @@ from gt3bgm import seqg as sq
 GROUPS = 17
 passed = failed = 0
 
-
 def check(ok: bool, what: str, detail: str = "") -> None:
     global passed, failed
     if ok:
@@ -37,7 +24,6 @@ def check(ok: bool, what: str, detail: str = "") -> None:
 
 
 def tone(seconds: float, rate: int = 44100) -> list[list[int]]:
-    """Something with real transients in it - a pure sine flatters an ADPCM encoder."""
     n = int(seconds * rate)
     left, right = [], []
     for i in range(n):
@@ -50,8 +36,6 @@ def tone(seconds: float, rate: int = 44100) -> list[list[int]]:
 
 
 def build_inf(songs) -> bytes:
-    """A minimal MADS index, written by hand so the reader is tested against something it did not produce.
-    songs: [(group, name, title, artist, MarkerSet)]"""
     ordered = sorted(songs, key=lambda s: s[0])
     entries_at = 0x10 + GROUPS * 8
     pos = entries_at + len(ordered) * ENTRY_SIZE
@@ -167,9 +151,7 @@ print("\nSequenced music (SEQG)")
 
 
 def build_seqg() -> bytes:
-    """Three sequences, written by hand. Sequence 0 track 0 has a two-byte control event (cmd 60, param 02:
-    the param byte looks like an end marker but is not), a chord (overlapping notes) and padding after
-    the real end marker."""
+
     n1 = bytes([0x00, 0xBC, 0x64, 0x60, 0x00, 0xC0, 0x64, 0x30])          # two notes at once, overlapping
     mid = bytes([0x10, 0x60, 0x02])                                        # control event, param 02
     n2 = bytes([0x10, 0xBE, 0x50, 0x20])
